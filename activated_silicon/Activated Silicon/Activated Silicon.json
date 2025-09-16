@@ -1,0 +1,93 @@
+{
+  "TITLE": "",
+  "DESCRIPTION": "",
+  "Summary": "",
+  "Owner": "",
+  "Tags": [],
+  "Created": "2025-09-15",
+  "Last Updated": "2025-09-15",
+  "TimerStats": {
+    "version": 1,
+    "bin_edges_sec": [
+      30,
+      60,
+      120,
+      300,
+      600,
+      1200,
+      1800,
+      3600,
+      7200
+    ],
+    "overall": {
+      "runs": 2,
+      "hist": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "ewma_sec": 349.26135899999997,
+      "last_durations_sec": [
+        366,
+        297
+      ]
+    },
+    "by_doc_type": {
+      "EPSA": {
+        "runs": 1,
+        "hist": [
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0
+        ],
+        "ewma_sec": 366.414309,
+        "last_durations_sec": [
+          366
+        ]
+      },
+      "WCCA": {
+        "runs": 0,
+        "hist": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "ewma_sec": null,
+        "last_durations_sec": []
+      },
+      "FMEA": {
+        "runs": 1,
+        "hist": [
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        "ewma_sec": 297.802509,
+        "last_durations_sec": [
+          297
+        ]
+      }
+    },
+    "updated_at": "2025-09-15"
+  }
+}
