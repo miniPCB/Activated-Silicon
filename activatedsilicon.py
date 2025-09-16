@@ -1153,23 +1153,32 @@ class CatalogWindow(QMainWindow):
             # Final Markdown
             text = self.build_markdown(fields, used_rows, netlist, partlist, pin_rows, test_rows, epsa_txt, wcca_txt, fmea_txt)
 
-            # --- Atomic write with timestamped backup ---
+            # --- Atomic write with ephemeral backup that gets deleted after success ---
+            bak_path = None
             try:
                 # 1) Write to a temp file first
                 tmp_path = self.current_path.with_suffix(self.current_path.suffix + f".tmp.{os.getpid()}.{now_stamp()}")
                 tmp_path.write_text(text, encoding="utf-8")
 
-                # 2) After successful temp write, create a backup of current file (if it exists)
+                # 2) Create a backup of the current file (if it exists)
                 if self.current_path.exists():
                     bak_path = self.current_path.with_suffix(self.current_path.suffix + f".bak.{now_stamp()}")
                     try:
                         shutil.copy2(str(self.current_path), str(bak_path))
                     except Exception:
                         # Backup failure shouldn't block the save
-                        pass
+                        bak_path = None
 
                 # 3) Atomically replace original with the temp file
                 os.replace(str(tmp_path), str(self.current_path))
+
+                # 4) Success: remove the backup to avoid clutter
+                if bak_path and Path(bak_path).exists():
+                    try:
+                        Path(bak_path).unlink()
+                    except Exception:
+                        # Non-fatal if we can't delete the backup
+                        pass
 
             except Exception as e:
                 # Clean up temp on error
@@ -1201,12 +1210,12 @@ class CatalogWindow(QMainWindow):
             tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
 
             meta = {
-                "TITLE":       (self.folder_title.text() or "").upper(),
-                "DESCRIPTION": (self.folder_desc.text()  or "").upper(),
-                "Summary":     self.folder_summary.toPlainText().strip(),
-                "Owner":       (self.folder_owner.text() or "").strip(),
-                "Tags":        tags_list,
-                "Created":     created,
+                "TITLE":        (self.folder_title.text() or "").upper(),
+                "DESCRIPTION":  (self.folder_desc.text()  or "").upper(),
+                "Summary":      self.folder_summary.toPlainText().strip(),
+                "Owner":        (self.folder_owner.text() or "").strip(),
+                "Tags":         tags_list,
+                "Created":      created,
                 "Last Updated": today_iso()
             }
 
