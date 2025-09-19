@@ -68,7 +68,7 @@ def maturity_label_to_code(label: str) -> int:
     if not label: return 0
     label = label.strip()
     m = re.match(r"^\s*([0-3])", label)
-    if m: 
+    if m:
         return int(m.group(1))
     # try by name
     return MATURITY_NAME_TO_CODE.get(label.lower(), 0)
@@ -336,7 +336,7 @@ def md_table_to_rows(md: str) -> list[list[str]]:
                 if i+1 < len(lines) and set(lines[i+1].replace("|","").strip()) <= set("-: "):
                     in_table = True
             if in_table:
-                if set(s.replace("|","").strip()) <= set("-: "): 
+                if set(s.replace("|","").strip()) <= set("-: "):
                     continue
                 cells = [c.strip() for c in s.strip("|").split("|")]
                 rows.append(cells)
@@ -405,11 +405,18 @@ class OpenAIWorker(QThread):
 
         instructions = (
             "You are an expert electronics reliability and analysis assistant. "
-            "Given circuit metadata, netlist, partlist, and current EPSA/WCCA/FMEA sections "
-            "with maturity levels (placeholder/immature/mature/locked), produce *structured suggestions* "
-            "for each section. Obey maturity strictly: if 'locked', do not change content—provide comments only. "
-            "Prefer diffs anchored by headings/tables, but always include a full 'proposed_md' for each section. "
-            "Output must be STRICT JSON that validates the response schema; no markdown fences or extra text."
+            "Given circuit metadata, netlist, partlist, and current EPSA/WCCA/FMEA sections with maturity levels, "
+            "produce structured improvements for each analysis section.\n\n"
+            "HARD REQUIREMENTS:\n"
+            "1) For EACH of EPSA, WCCA, and FMEA, include a SINGLE 'Master Analysis Table' as the FIRST table in the section. "
+            "   The table MUST have these columns (exact order):\n"
+            "   | Item | Function/Block | Assumptions | Method | Key Equations | Inputs/Bounds | Worst-Case Case | Result/Value | Margin | Determination | Risk | Detection/Controls | Severity | Occurrence | Detection | RPN | Criticality Class | Conclusion | Actions/Recommendations | References |\n"
+            "   - Populate every row with concise, engineering-accurate content.\n"
+            "   - Use additional rows to cover all relevant components/blocks and stress cases.\n"
+            "2) After the table, include well-structured narrative subsections as needed (e.g., Mission Profile, Environments, Parts Stress, "
+            "   Corner Cases, Calculation Details, Conclusions).\n"
+            "3) Respect maturity: if a section is 'locked', do NOT change its content—return the same text in 'proposed_md' and put your commentary in 'rationale'.\n"
+            "4) Output must be STRICT JSON that validates the provided response schema. No markdown fences, no extra prose outside JSON.\n"
         )
 
         response_schema = {
@@ -710,6 +717,9 @@ class CatalogWindow(QMainWindow):
         self._ai_start_ts: datetime.datetime | None = None
         self._eta_timer: QTimer | None = None
         self._eta_target_sec: int | None = None
+        
+        # Maturity state (editor may drop HTML comments; keep a canonical value here)
+        self.maturity_state = {"EPSA": 0, "WCCA": 0, "FMEA": 0}
 
         # Toolbar
         tb = QToolBar("Main", self); tb.setMovable(False); self.addToolBar(tb)
@@ -856,6 +866,10 @@ class CatalogWindow(QMainWindow):
         fmea_tab, self.fmea_edit, self.fmea_cmb = build_markdown_tab("FMEA")
         self.tabs.addTab(epsa_tab, "EPSA"); self.tabs.addTab(wcca_tab, "WCCA"); self.tabs.addTab(fmea_tab, "FMEA")
 
+        # AI Statistics tab (new)
+        self.ai_stats_tab = self._make_ai_stats_tab()
+        self.tabs.addTab(self.ai_stats_tab, "AI Statistics")
+
         self.tabs.currentChanged.connect(self.on_tab_changed)
         right_layout.addWidget(self.tabs, 1)
 
@@ -938,6 +952,130 @@ class CatalogWindow(QMainWindow):
     def is_markdown(self, path: Path) -> bool:
         return path.is_file() and path.suffix.lower()==".md"
 
+    def _ensure_maturity_marker(self, _section_name: str, md: str, cmb=None) -> str:
+        """
+        Back-compat shim. Old code calls:
+            _ensure_maturity_marker("EPSA", md, self.epsa_cmb)
+        New flow uses a canonical integer code; this adapter preserves old behavior.
+        """
+        if cmb is not None:
+            code = maturity_label_to_code(cmb.currentText())
+        else:
+            # Fallback: read from text if no combobox is provided
+            code = maturity_read_from_text(md) or 0
+        return self._ensure_maturity_marker_code(md, int(code))
+
+    # --- Section normalizers -------------------------------------------------
+    def _strip_inner_heading_preserve_maturity(self, section_name: str, body_md: str) -> str:
+        """
+        If the body starts with an optional maturity comment and then a duplicate
+        inner '## <section_name>' heading, remove ONLY that inner heading while
+        preserving the maturity marker and spacing.
+        """
+        if not body_md:
+            return body_md
+
+        lines = body_md.splitlines()
+        i = 0
+        prefix = []
+
+        # Preserve leading blanks
+        while i < len(lines) and not lines[i].strip():
+            prefix.append(lines[i])
+            i += 1
+
+        # Preserve maturity comment if present
+        maturity_re = re.compile(
+            r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked)\s*-->",
+            re.I,
+        )
+        if i < len(lines) and maturity_re.search(lines[i] or ""):
+            prefix.append(lines[i])
+            i += 1
+            # Optional blank after maturity comment
+            if i < len(lines) and not lines[i].strip():
+                prefix.append(lines[i])
+                i += 1
+
+        # Remove a duplicate inner heading if it appears next
+        if i < len(lines) and lines[i].strip().lower() == f"## {section_name}".lower():
+            i += 1
+            if i < len(lines) and not lines[i].strip():
+                i += 1
+            return "\n".join(prefix + lines[i:]).lstrip("\n")
+
+        return body_md
+
+    # --- Backwards-compat alias (so any stray old callsites still resolve correctly)
+    _strip_redundant_section_heading = _strip_inner_heading_preserve_maturity
+
+    def _normalize_section_body(self, section_name: str, body_md: str) -> str:
+        """
+        Clean an analysis section body *without* adding outer '## <section>' heading.
+        - ASCII sanitize
+        - preserve a single maturity marker (if present) and keep it at the top
+        - remove duplicate inner '## <section_name>' heading
+        - trim leading/trailing blank lines
+        """
+        md = ascii_sanitize(body_md or "")
+
+        # Remove duplicate inner heading but keep any maturity marker intact
+        md = self._strip_inner_heading_preserve_maturity(section_name, md)
+
+        # Collapse to a single maturity marker at the very top
+        maturity_re = re.compile(
+            r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked)\s*-->",
+            re.I,
+        )
+        found = maturity_re.findall(md)
+        marker = found[0] if found else None
+        md_wo = maturity_re.sub("", md).lstrip("\n")
+
+        return (f"{marker}\n{md_wo}" if marker else md_wo).strip("\n")
+
+    # ---------- Section body normalization ----------
+    @staticmethod
+    def _strip_redundant_section_heading(self, section_name: str, body_md: str) -> str:
+        """
+        If the body starts with an optional maturity comment and then a duplicate
+        '## <section_name>' heading, remove ONLY that inner heading while preserving
+        the maturity marker and surrounding spacing.
+        """
+        if not body_md:
+            return body_md
+
+        lines = body_md.splitlines()
+        i = 0
+        prefix = []
+
+        # Preserve leading blanks (harmless)
+        while i < len(lines) and not lines[i].strip():
+            prefix.append(lines[i])
+            i += 1
+
+        # Preserve maturity comment if present
+        maturity_re = re.compile(
+            r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked)\s*-->",
+            re.I
+        )
+        if i < len(lines) and maturity_re.search(lines[i] or ""):
+            prefix.append(lines[i])
+            i += 1
+            # Optional blank after maturity
+            if i < len(lines) and not lines[i].strip():
+                prefix.append(lines[i])
+                i += 1
+
+        # If next nonblank is a duplicate inner heading, drop it
+        if i < len(lines) and lines[i].strip().lower() == f"## {section_name}".lower():
+            i += 1
+            # Skip one optional blank after the heading
+            if i < len(lines) and not lines[i].strip():
+                i += 1
+            return "\n".join(prefix + lines[i:]).lstrip("\n")
+
+        return body_md
+
     # ---------- Table helpers ----------
     def add_row(self, table: QTableWidget, default=None):
         r = table.rowCount(); table.insertRow(r)
@@ -958,9 +1096,13 @@ class CatalogWindow(QMainWindow):
         if path.is_dir():
             self.current_path=None; self.current_folder=path; self.path_label.setText(f"Folder: {path}")
             self.load_folder_meta(path); self.tabs.setVisible(False); self.folder_panel.setVisible(True); self.review.setVisible(False)
+            # Update AI stats view for current folder
+            self.refresh_ai_stats()
             return
         if self.is_markdown(path):
             self.current_folder=None; self.load_file_lazy(path); self.tabs.setVisible(True); self.folder_panel.setVisible(False); self.review.setVisible(False)
+            # Update AI stats view for parent folder
+            self.refresh_ai_stats()
 
     def load_folder_meta(self, folder: Path):
         """
@@ -990,93 +1132,170 @@ class CatalogWindow(QMainWindow):
         self.folder_created.setText(meta.get("Created", "") or "")
         self.folder_updated.setText(meta.get("Last Updated", "") or "")
 
+    def _refresh_maturity_dropdown_for_current_tab(self):
+        if not self.tabs.count():
+            return
+        label = self.tabs.tabText(self.tabs.currentIndex())
+        if label not in ("EPSA", "WCCA", "FMEA"):
+            return
+        cmb = {"EPSA": self.epsa_cmb, "WCCA": self.wcca_cmb, "FMEA": self.fmea_cmb}[label]
+        code = int(self.maturity_state.get(label, 0))
+        cmb.blockSignals(True)
+        cmb.setCurrentText(maturity_code_to_label(code))
+        cmb.blockSignals(False)
+
     def load_file_lazy(self, path: Path):
+        """
+        Load a Markdown entry file without rendering all sections immediately.
+        Also seeds self.maturity_state (EPSA/WCCA/FMEA) from the raw file text,
+        since the editor may drop HTML comments like <!-- maturity: ... -->.
+        """
         try:
             text = path.read_text(encoding="utf-8")
         except Exception as e:
-            self.error("Error", f"Failed to read file:\n{e}"); return
-        self.current_path = path; self.path_label.setText(f"File: {path}")
+            self.error("Error", f"Failed to read file:\n{e}")
+            return
 
-        fields = {k:"" for k,_ in FIELD_ORDER}; used_rows=[]
-        lines = [ln.rstrip("\n") for ln in text.splitlines()]; n = len(lines)
+        self.current_path = path
+        self.path_label.setText(f"File: {path}")
 
-        # Metadata (robust parse)
-        i=0
-        while i<n:
+        # --- Parse top metadata table ---
+        fields = {k: "" for k, _ in FIELD_ORDER}
+        used_rows = []
+        lines = [ln.rstrip("\n") for ln in text.splitlines()]
+        n = len(lines)
+
+        i = 0
+        while i < n:
             if lines[i].strip().lower().startswith("| field") and "| value" in lines[i].lower():
-                i+=2
-                while i<n and lines[i].strip().startswith("|"):
+                i += 2
+                while i < n and lines[i].strip().startswith("|"):
                     m = MD_ROW_RE.match(lines[i].strip())
                     if m:
-                        field=m.group("field").strip(); value=m.group("value").strip()
-                        if field in fields: fields[field]=value
-                    i+=1
+                        field = m.group("field").strip()
+                        value = m.group("value").strip()
+                        if field in fields:
+                            fields[field] = value
+                    i += 1
                 break
-            i+=1
+            i += 1
 
         def find_header(title: str):
-            target=f"## {title}".lower()
+            target = f"## {title}".lower()
             for idx, ln in enumerate(lines):
-                if ln.strip().lower()==target: return idx
+                if ln.strip().lower() == target:
+                    return idx
             return None
 
-        # Used On
+        # --- Parse "Used On" table (if present) ---
         uix = find_header("Used On")
         if uix is not None:
-            j=uix+1
-            while j<n and not lines[j].strip().startswith("|"): j+=1
-            j+=2
-            while j<n and lines[j].strip().startswith("|"):
+            j = uix + 1
+            # advance to header row
+            while j < n and not lines[j].strip().startswith("|"):
+                j += 1
+            # skip divider
+            j += 2
+            while j < n and lines[j].strip().startswith("|"):
                 m = MD_ROW_RE.match(lines[j].strip())
-                if m: used_rows.append([m.group("field").strip(), m.group("value").strip()])
-                j+=1
+                if m:
+                    used_rows.append([m.group("field").strip(), m.group("value").strip()])
+                j += 1
 
         def capture_block(title: str) -> str:
             idx = find_header(title)
-            if idx is None: return ""
-            j=idx+1; chunk=[]
-            while j<n and not lines[j].startswith("## "):
-                chunk.append(lines[j]); j+=1
-            while chunk and not chunk[0].strip(): chunk.pop(0)
-            while chunk and not chunk[-1].strip(): chunk.pop()
+            if idx is None:
+                return ""
+            j = idx + 1
+            chunk = []
+            while j < n and not lines[j].startswith("## "):
+                chunk.append(lines[j])
+                j += 1
+            # trim leading/trailing blanks
+            while chunk and not chunk[0].strip():
+                chunk.pop(0)
+            while chunk and not chunk[-1].strip():
+                chunk.pop()
             return "\n".join(chunk)
 
-        for name in SECTION_NAMES:
-            self.section_texts[name] = capture_block(name); self.section_loaded[name]=False
+        # --- Cache raw section texts; mark as not-yet-hydrated in editors ---
+        self.section_texts = {name: "" for name in SECTION_NAMES}
+        self.section_loaded = {name: False for name in SECTION_NAMES}
+        self.pin_rows_cache = []
+        self.test_rows_cache = []
 
-        # Fill minimal UI
-        for key,_ in FIELD_ORDER: self.field_widgets[key].setText(fields.get(key,""))
+        for name in SECTION_NAMES:
+            self.section_texts[name] = capture_block(name)
+            self.section_loaded[name] = False
+
+        # --- NEW: seed canonical maturity from RAW text (editor may drop comments) ---
+        # Requires: self.maturity_state = {"EPSA": 0, "WCCA": 0, "FMEA": 0} set in __init__
+        for sec in ("EPSA", "WCCA", "FMEA"):
+            raw = self.section_texts.get(sec, "") or ""
+            code = maturity_read_from_text(raw)
+            self.maturity_state[sec] = 0 if code is None else int(code)
+
+        # --- Populate minimal UI (top fields + Used On) ---
+        for key, _ in FIELD_ORDER:
+            self.field_widgets[key].setText(fields.get(key, ""))
+
         self.used_table.setRowCount(0)
-        for pn,occ in used_rows:
+        for pn, occ in used_rows:
             r = self.used_table.rowCount()
             self.used_table.insertRow(r)
-            self.used_table.setItem(r,0,QTableWidgetItem(pn))
-            self.used_table.setItem(r,1,QTableWidgetItem(occ))
+            self.used_table.setItem(r, 0, QTableWidgetItem(pn))
+            self.used_table.setItem(r, 1, QTableWidgetItem(occ))
 
+        # refresh description column in the tree
         self.proxy.refresh_desc(path)
 
     # ---------- Hydrate on demand ----------
     def on_tab_changed(self, index: int):
         label = self.tabs.tabText(index)
-        if label in ("Netlist","Partlist","EPSA","WCCA","FMEA"):
-            ed = {"Netlist":self.netlist_edit,"Partlist":self.partlist_edit,"EPSA":self.epsa_edit,"WCCA":self.wcca_edit,"FMEA":self.fmea_edit}[label]
+
+        if label in ("Netlist", "Partlist", "EPSA", "WCCA", "FMEA"):
+            ed_map = {
+                "Netlist": self.netlist_edit,
+                "Partlist": self.partlist_edit,
+                "EPSA": self.epsa_edit,
+                "WCCA": self.wcca_edit,
+                "FMEA": self.fmea_edit,
+            }
+            ed = ed_map[label]
+
+            # Lazy hydrate editor content from raw cache when the tab is first shown
             if not self.section_loaded.get(label):
-                ed.set_markdown_text(self.section_texts.get(label,"") or "")
-                self.section_loaded[label]=True
+                ed.set_markdown_text(self.section_texts.get(label, "") or "")
+                self.section_loaded[label] = True
                 ed.textChanged.connect(lambda sn=label, e=ed: self._on_markdown_changed(sn, e))
-            # Maturity sync for eng tabs
-            if label in ("EPSA","WCCA","FMEA"):
-                cmb = {"EPSA":self.epsa_cmb,"WCCA":self.wcca_cmb,"FMEA":self.fmea_cmb}[label]
-                cur_md = ed.markdown_text()
-                code = maturity_read_from_text(cur_md)
-                if code is None: code = 0
+
+            # Maturity sync for engineering tabs
+            if label in ("EPSA", "WCCA", "FMEA"):
+                cmb_map = {"EPSA": self.epsa_cmb, "WCCA": self.wcca_cmb, "FMEA": self.fmea_cmb}
+                cmb = cmb_map[label]
+
+                # 1) Drive dropdown from canonical state (do NOT read editor; it may drop comments)
+                code = int(self.maturity_state.get(label, 0))
                 cmb.blockSignals(True)
                 cmb.setCurrentText(maturity_code_to_label(code))
                 cmb.blockSignals(False)
-                cmb.currentTextChanged.connect(lambda _=None, sn=label, e=ed, c=cmb: self._write_maturity_marker(sn, e, maturity_label_to_code(c.currentText())))
-        elif label=="Pin Interface":
+
+                # 2) Connect once: when user changes dropdown, update state (and optionally show marker)
+                if not getattr(ed, "_maturity_connected", False):
+                    def _on_maturity_changed(_text=None, sn=label, c=cmb, e=ed):
+                        self.maturity_state[sn] = maturity_label_to_code(c.currentText())
+                        # Optional: keep marker visible in the editor (Qt may later drop it; harmless)
+                        try:
+                            self._write_maturity_marker(sn, e, self.maturity_state[sn])
+                        except Exception:
+                            pass
+
+                    cmb.currentTextChanged.connect(_on_maturity_changed)
+                    ed._maturity_connected = True
+
+        elif label == "Pin Interface":
             self._hydrate_table_tab("Pin Interface", self.pin_table, PIN_HEADERS, cache_attr="pin_rows_cache")
-        elif label=="Tests":
+        elif label == "Tests":
             self._hydrate_table_tab("Tests", self.test_table, TEST_HEADERS, cache_attr="test_rows_cache")
 
     def _on_markdown_changed(self, section_name: str, editor: ZoomableMarkdownEdit):
@@ -1141,10 +1360,13 @@ class CatalogWindow(QMainWindow):
             wcca_txt = harvest_markdown("WCCA", self.wcca_edit)
             fmea_txt = harvest_markdown("FMEA", self.fmea_edit)
 
-            # Ensure maturity comment markers are present/updated
-            epsa_txt = self._ensure_maturity_marker("EPSA", epsa_txt, self.epsa_cmb)
-            wcca_txt = self._ensure_maturity_marker("WCCA", wcca_txt, self.wcca_cmb)
-            fmea_txt = self._ensure_maturity_marker("FMEA", fmea_txt, self.fmea_cmb)
+            # Normalize + ensure maturity markers
+            epsa_txt = self._ensure_maturity_marker("EPSA",
+                        self._normalize_section_body("EPSA", epsa_txt), self.epsa_cmb)
+            wcca_txt = self._ensure_maturity_marker("WCCA",
+                        self._normalize_section_body("WCCA", wcca_txt), self.wcca_cmb)
+            fmea_txt = self._ensure_maturity_marker("FMEA",
+                        self._normalize_section_body("FMEA", fmea_txt), self.fmea_cmb)
 
             # Tables
             pin_rows  = harvest_table(self.pin_table,  len(PIN_HEADERS),  "pin_rows_cache",  "Pin Interface")
@@ -1153,35 +1375,12 @@ class CatalogWindow(QMainWindow):
             # Final Markdown
             text = self.build_markdown(fields, used_rows, netlist, partlist, pin_rows, test_rows, epsa_txt, wcca_txt, fmea_txt)
 
-            # --- Atomic write with ephemeral backup that gets deleted after success ---
-            bak_path = None
+            # --- Atomic write (no backups created) ---
             try:
-                # 1) Write to a temp file first
                 tmp_path = self.current_path.with_suffix(self.current_path.suffix + f".tmp.{os.getpid()}.{now_stamp()}")
                 tmp_path.write_text(text, encoding="utf-8")
-
-                # 2) Create a backup of the current file (if it exists)
-                if self.current_path.exists():
-                    bak_path = self.current_path.with_suffix(self.current_path.suffix + f".bak.{now_stamp()}")
-                    try:
-                        shutil.copy2(str(self.current_path), str(bak_path))
-                    except Exception:
-                        # Backup failure shouldn't block the save
-                        bak_path = None
-
-                # 3) Atomically replace original with the temp file
-                os.replace(str(tmp_path), str(self.current_path))
-
-                # 4) Success: remove the backup to avoid clutter
-                if bak_path and Path(bak_path).exists():
-                    try:
-                        Path(bak_path).unlink()
-                    except Exception:
-                        # Non-fatal if we can't delete the backup
-                        pass
-
+                os.replace(str(tmp_path), str(self.current_path))  # atomic on same filesystem
             except Exception as e:
-                # Clean up temp on error
                 try:
                     if 'tmp_path' in locals() and tmp_path.exists():
                         tmp_path.unlink()
@@ -1235,33 +1434,44 @@ class CatalogWindow(QMainWindow):
         self.info("Save", "Select a folder or a Markdown file to save.")
 
     def build_markdown(self, fields: dict, used_rows: list, netlist: str, partlist_text: str,
-                       pin_rows: list, test_rows: list, epsa_text: str, wcca_text: str, fmea_text: str) -> str:
+                    pin_rows: list, test_rows: list, epsa_text: str, wcca_text: str, fmea_text: str) -> str:
         meta_lines = ["| Field                  | Value                     |","| ---------------------- | ------------------------- |"]
         for key,_ in FIELD_ORDER: meta_lines.append(f"| {key:<22} | {fields.get(key,'').strip()} |")
+
         used = ["## Used On","","| PN         | Occurrences |","| ---------- | ----------- |"]
         if used_rows:
             for pn,occ in used_rows: used.append(f"| {pn or '(None)'} | {occ or '0'} |")
         else:
             used.append("| (None)     | 0           |")
-        net_block = netlist.strip() if netlist.strip() else "(paste or type your netlist here)"
+
+        net_block  = netlist.strip() if netlist.strip() else "(paste or type your netlist here)"
         part_block = partlist_text.strip() if partlist_text.strip() else "(paste or type your partlist here — raw markdown; tables/lists render)"
+
         def build_table(headers, rows):
-            out = ["| " + " | ".join(headers) + " |","| " + " | ".join("-"*len(h) for h in headers) + " |"]
+            out = ["| " + " | ".join(headers) + " |",
+                "| " + " | ".join("-"*len(h) for h in headers) + " |"]
             for r in rows:
                 rr = (r + [""]*len(headers))[:len(headers)]
                 out.append("| " + " | ".join(rr) + " |")
             return out
-        pin = ["## Pin Interface",""] + build_table(PIN_HEADERS, pin_rows)
-        tests=["## Tests",""] + build_table(TEST_HEADERS, test_rows)
+
+        pin   = ["## Pin Interface",""] + build_table(PIN_HEADERS, pin_rows)
+        tests = ["## Tests",""] + build_table(TEST_HEADERS, test_rows)
+
+        # ⬇️ Use the ALREADY-NORMALIZED section bodies passed in
+        epsa_body = epsa_text.strip() or maturity_comment(0) + "\n(paste EPSA here)"
+        wcca_body = wcca_text.strip() or maturity_comment(0) + "\n(paste WCCA here)"
+        fmea_body = fmea_text.strip() or maturity_comment(0) + "\n(paste FMEA here)"
+
         out = [
             "# Circuit Metadata","",f"**Last Updated:** {today_iso()}","",
             "\n".join(meta_lines),"", "\n".join(used),"",
             "## Netlist","", net_block,"",
             "## Partlist","", part_block,"",
             "\n".join(pin),"", "\n".join(tests),"",
-            "## EPSA","", epsa_text.strip() or maturity_comment(0) + "\n(paste EPSA here)","",
-            "## WCCA","", wcca_text.strip() or maturity_comment(0) + "\n(paste WCCA here)","",
-            "## FMEA","", fmea_text.strip() or maturity_comment(0) + "\n(paste FMEA here)",""
+            "## EPSA","",  epsa_body,"",
+            "## WCCA","",  wcca_body,"",
+            "## FMEA","",  fmea_body,"",
         ]
         return "\n".join(out)
 
@@ -1275,11 +1485,20 @@ class CatalogWindow(QMainWindow):
             md = cm + "\n" + md
         editor.set_markdown_text(md)  # refresh
 
-    def _ensure_maturity_marker(self, name: str, md: str, cmb: QComboBox | None) -> str:
-        code = maturity_label_to_code(cmb.currentText()) if cmb else (maturity_read_from_text(md) or 0)
+    def _ensure_maturity_marker_code(self, md: str, code: int) -> str:
+        """
+        Guarantee exactly one <!-- maturity: X ... --> marker at the top of md,
+        replacing any existing marker regardless of wording/case.
+        """
         cm = maturity_comment(code)
-        if "<!-- maturity:" in md:
-            return re.sub(r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked).*?-->", cm, md, flags=re.I)
+        md = md or ""
+        if "<!-- maturity:" in md.lower():
+            return re.sub(
+                r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked).*?-->",
+                cm,
+                md,
+                flags=re.I,
+            )
         return cm + "\n" + md
 
     # ---------- AI Assist ----------
@@ -1383,6 +1602,12 @@ class CatalogWindow(QMainWindow):
         meta["TimerStats"] = ts
         meta["TimerStats"]["updated_at"] = today_iso()
         (folder / f"{folder.name}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        # If the stats tab is visible, refresh it live
+        try:
+            if self.tabs.currentWidget() is self.ai_stats_tab:
+                self.refresh_ai_stats()
+        except Exception:
+            pass
 
     @staticmethod
     def _bin_index(edges, x):
@@ -1603,17 +1828,23 @@ class CatalogWindow(QMainWindow):
 
     def _apply_section_replace(self, section: str, new_md: str):
         ed = {"EPSA": self.epsa_edit, "WCCA": self.wcca_edit, "FMEA": self.fmea_edit}[section]
+        # Normalize to avoid inner duplicate headings (## EPSA/WCCA/FMEA)
+        new_md = self._normalize_section_body(section, new_md)
+
         cur = ed.markdown_text() if self.section_loaded.get(section) else self.section_texts.get(section,"")
         code = maturity_read_from_text(cur)
         if code is None:
             # sync from combobox if available
             cmb = {"EPSA":self.epsa_cmb,"WCCA":self.wcca_cmb,"FMEA":self.fmea_cmb}[section]
             code = maturity_label_to_code(cmb.currentText())
-        # Ensure marker persisted/updated
+
+        # Ensure a single maturity marker at the very top
+        cm = maturity_comment(code)
         if "<!-- maturity:" in new_md:
-            new = re.sub(r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked).*?-->", maturity_comment(code), new_md)
+            new = re.sub(r"<!--\s*maturity:\s*(?:[0-3]|placeholder|immature|mature|locked).*?-->", cm, new_md, flags=re.I)
         else:
-            new = maturity_comment(code) + "\n" + new_md
+            new = cm + "\n" + new_md
+
         ed.set_markdown_text(new)
         self.section_texts[section] = new
         self.section_loaded[section] = True
@@ -1650,7 +1881,7 @@ class CatalogWindow(QMainWindow):
         try: shutil.make_archive(str(temp_base),'zip', root_dir=str(script_dir.parent), base_dir=script_dir.name)
         except Exception as e:
             self.error("Archive", f"Failed to create archive:\n{e}"); return
-        temp_zip = Path(str(temp_base)+".zip"); 
+        temp_zip = Path(str(temp_base)+".zip");
         if not temp_zip.exists(): self.error("Archive","Archive creation failed."); return
         dest_zip = script_dir / f"{ts}.zip"
         try:
@@ -1716,7 +1947,7 @@ class CatalogWindow(QMainWindow):
         if base.is_file(): base = base.parent
         name, ok = self.ask_text("New Entry","File name (without extension):")
         if not ok or not name.strip(): return
-        safe = name.strip(); 
+        safe = name.strip();
         if not safe.lower().endswith(".md"): safe += ".md"
         target = base / safe
         if target.exists(): self.warn("Exists","A file with that name already exists."); return
@@ -1775,9 +2006,142 @@ class CatalogWindow(QMainWindow):
     def add_used_row(self):
         r=self.used_table.rowCount(); self.used_table.insertRow(r)
         self.used_table.setItem(r,0,QTableWidgetItem("")); self.used_table.setItem(r,1,QTableWidgetItem("1"))
-    def remove_used_row(self): 
+    def remove_used_row(self):
         r=self.used_table.currentRow()
         if r>=0: self.used_table.removeRow(r)
+
+    # ---------- AI Statistics Tab ----------
+    def _make_ai_stats_tab(self):
+        tab = QWidget(self)
+        v = QVBoxLayout(tab); v.setContentsMargins(0,0,0,0); v.setSpacing(8)
+
+        top = QHBoxLayout()
+        self.ai_stats_folder_lbl = QLabel("(no folder selected)")
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.refresh_ai_stats)
+        top.addWidget(QLabel("Folder:"))
+        top.addWidget(self.ai_stats_folder_lbl)
+        top.addStretch(1)
+        top.addWidget(btn_refresh)
+        v.addLayout(top)
+
+        # Overall summary table
+        self.ai_overall_tbl = QTableWidget(0, 5, tab)
+        self.ai_overall_tbl.setHorizontalHeaderLabels(["Metric", "Value", "P50 (s)", "P90 (s)", "Recent (last 10)"])
+        self.ai_overall_tbl.verticalHeader().setVisible(False)
+        self.ai_overall_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.ai_overall_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.ai_overall_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.ai_overall_tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.ai_overall_tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        v.addWidget(QLabel("Overall"))
+        v.addWidget(self.ai_overall_tbl)
+
+        # By-type table
+        self.ai_bytype_tbl = QTableWidget(0, 6, tab)
+        self.ai_bytype_tbl.setHorizontalHeaderLabels(["Doc Type", "Runs", "EWMA (s)", "P50 (s)", "P90 (s)", "Recent (last 10)"])
+        self.ai_bytype_tbl.verticalHeader().setVisible(False)
+        for c in range(5):
+            self.ai_bytype_tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.ai_bytype_tbl.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        v.addWidget(QLabel("By Document Type"))
+        v.addWidget(self.ai_bytype_tbl)
+
+        # Histogram table
+        self.ai_hist_tbl = QTableWidget(0, 3, tab)
+        self.ai_hist_tbl.setHorizontalHeaderLabels(["Bin (s)", "Overall Count", "Notes"])
+        self.ai_hist_tbl.verticalHeader().setVisible(False)
+        self.ai_hist_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.ai_hist_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.ai_hist_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        v.addWidget(QLabel("Histogram (Overall)"))
+        v.addWidget(self.ai_hist_tbl)
+
+        return tab
+
+    def _fmt_recent(self, arr):
+        if not arr: return ""
+        return ", ".join(str(x) for x in arr[-10:])
+
+    def _fmt_float(self, x, nd=1):
+        return "" if x is None else f"{float(x):.{nd}f}"
+
+    def _fmt_bins(self, edges):
+        # Build inclusive bins like <=30, 31-60, 61-120, ..., >last
+        if not edges:
+            return ["(no bins)"]
+        out = []
+        prev = 0
+        for e in edges[:-1]:
+            out.append(f"{prev+1}-{e}")
+            prev = e
+        out.insert(0, f"<= {edges[0]}")
+        out.append(f">{edges[-1]}")
+        return out
+
+    def refresh_ai_stats(self):
+        folder = self._folder_of_current_file()
+        if not folder:
+            self.ai_stats_folder_lbl.setText("(no folder selected)")
+            self.ai_overall_tbl.setRowCount(0)
+            self.ai_bytype_tbl.setRowCount(0)
+            self.ai_hist_tbl.setRowCount(0)
+            return
+
+        self.ai_stats_folder_lbl.setText(str(folder))
+        ts = self._load_timer_stats(folder)  # creates skeleton if missing
+
+        # Overall table
+        ov = ts.get("overall", {})
+        edges = ts.get("bin_edges_sec", [30,60,120,300,600,1200,1800,3600,7200])
+        p50 = self._percentile(ov.get("last_durations_sec", []), 0.5)
+        p90 = self._percentile(ov.get("last_durations_sec", []), 0.9)
+        self.ai_overall_tbl.setRowCount(0)
+        def add_overall(metric, value, p50, p90, recent):
+            r = self.ai_overall_tbl.rowCount(); self.ai_overall_tbl.insertRow(r)
+            self.ai_overall_tbl.setItem(r, 0, QTableWidgetItem(metric))
+            self.ai_overall_tbl.setItem(r, 1, QTableWidgetItem(str(value)))
+            self.ai_overall_tbl.setItem(r, 2, QTableWidgetItem("" if p50 is None else str(int(p50))))
+            self.ai_overall_tbl.setItem(r, 3, QTableWidgetItem("" if p90 is None else str(int(p90))))
+            self.ai_overall_tbl.setItem(r, 4, QTableWidgetItem(self._fmt_recent(recent)))
+
+        add_overall("Runs", ov.get("runs", 0), p50, p90, ov.get("last_durations_sec", []))
+        add_overall("EWMA (s)", self._fmt_float(ov.get("ewma_sec"), 1), p50, p90, ov.get("last_durations_sec", []))
+
+        # By type
+        self.ai_bytype_tbl.setRowCount(0)
+        by = ts.get("by_doc_type", {})
+        for doc in ("EPSA", "WCCA", "FMEA"):
+            slot = by.get(doc, {})
+            rp50 = self._percentile(slot.get("last_durations_sec", []), 0.5)
+            rp90 = self._percentile(slot.get("last_durations_sec", []), 0.9)
+            r = self.ai_bytype_tbl.rowCount(); self.ai_bytype_tbl.insertRow(r)
+            self.ai_bytype_tbl.setItem(r, 0, QTableWidgetItem(doc))
+            self.ai_bytype_tbl.setItem(r, 1, QTableWidgetItem(str(slot.get("runs", 0))))
+            self.ai_bytype_tbl.setItem(r, 2, QTableWidgetItem(self._fmt_float(slot.get("ewma_sec"), 1)))
+            self.ai_bytype_tbl.setItem(r, 3, QTableWidgetItem("" if rp50 is None else str(int(rp50))))
+            self.ai_bytype_tbl.setItem(r, 4, QTableWidgetItem("" if rp90 is None else str(int(rp90))))
+            self.ai_bytype_tbl.setItem(r, 5, QTableWidgetItem(self._fmt_recent(slot.get("last_durations_sec", []))))
+
+        # Histogram
+        self.ai_hist_tbl.setRowCount(0)
+        labels = self._fmt_bins(edges)
+        hist = (ov.get("hist") or [0] * (len(labels)))[:len(labels)]
+        # If hist shorter (older file), pad
+        if len(hist) < len(labels):
+            hist = hist + [0] * (len(labels) - len(hist))
+        for i, lab in enumerate(labels):
+            r = self.ai_hist_tbl.rowCount(); self.ai_hist_tbl.insertRow(r)
+            self.ai_hist_tbl.setItem(r, 0, QTableWidgetItem(lab))
+            self.ai_hist_tbl.setItem(r, 1, QTableWidgetItem(str(hist[i])))
+            note = ""
+            if i == 0:
+                note = f"≤ {edges[0]}s"
+            elif i == len(labels) - 1:
+                note = f"> {edges[-1]}s"
+            else:
+                note = f"{lab} s"
+            self.ai_hist_tbl.setItem(r, 2, QTableWidgetItem(note))
 
 # ---------- App boot ----------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
